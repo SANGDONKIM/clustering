@@ -1,0 +1,211 @@
+---
+title: "prediction based clustering"
+output: html_document
+---
+
+
+
+
+```{r}
+library(data.table)
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+
+theme_set(theme_bw())
+```
+
+
+```{r}
+dat1 <- fread("dat1.csv", encoding = "UTF-8")[,-1]
+dat2 <- fread("dat2.csv", encoding = "UTF-8")[,-1]
+dat3 <- fread("dat3.csv", encoding = "UTF-8")[,-1]
+dat4 <- fread("dat4.csv", encoding = "UTF-8")[,-1]
+node_labels <- fread("node_labels.csv")[,-1]
+dat <- bind_rows(dat1, dat2, dat3, dat4)
+
+#rm(dat1, dat2, dat3, dat4)
+```
+
+
+```{r}
+dat <- dat %>% 
+    left_join(node_labels, by = c("rent_place" = "node_ids"))
+```
+
+```{r}
+dat <- dat %>% 
+    select(-c(user_seq, bike_id, return_place, return_date, using_time, return_hour, return_day, return_wdays, region))
+
+
+dat <- dat %>% 
+    select(-c(rent_hour, rent_days, rent_wdays, month))
+
+dat <- dat %>% 
+    rename(date = rent_date) %>% 
+    mutate(year = year(date), 
+           month = month(date), 
+           day = day(date),
+           wday = wday(date, label = T), 
+           hour = hour(date)) %>% 
+    select(date, year, month, day, wday, everything())
+```
+
+
+```{r}
+cluster_data <- dat %>% 
+    group_by(kmeans, year, month, day, hour) %>% 
+    count() %>% 
+    ungroup()
+#write.csv(cluster_data, "cluster_data.csv")
+```
+
+
+```{r}
+weather2019 <- fread("weather2019.csv")
+colnames(weather2019) <- c("dd","region", "date", "temp", "rain", "wind", "humidity", "sunshine", "snow", "visibility")
+
+weather2019 <- weather2019[,-c(1,2)]
+
+weather2019 <- weather2019 %>% 
+    mutate(date = ymd_hm(date), 
+           year = year(date), 
+           month = month(date), 
+           day = day(date), 
+           wday = wday(date), 
+           hour = hour(date)) %>% 
+    select(year, month, day, wday, hour, everything(), -date)
+
+```
+
+
+
+```{r}
+weather2019 <- weather2019 %>% 
+    mutate(rain = replace_na(rain, 0), 
+           snow = if_else(is.na(snow), 0, 1)) %>% 
+    select(-sunshine)
+    
+weather2019 %>% is.na() %>% colSums()
+
+```
+
+```{r}
+clust_data <- cluster_data %>% 
+    left_join(weather2019, by = c("year" = "year", "month" = "month", "day" = "day", "hour" = "hour"))
+
+
+clust_data <- clust_data %>% 
+    rename(count = n) %>% 
+    recipe(count ~ .) %>% 
+    step_meanimpute(wind) %>% 
+    prep() %>% 
+    juice()
+
+```
+```{r}
+clust_data %>% 
+    filter(kmeans == 0 & !wday%in%c(1, 7))
+```
+
+
+```{r}
+
+rf_spec <- rand_forest(mtry = tune(), 
+                          trees = 100, 
+                          min_n = tune()) %>%  
+    set_engine("ranger") %>%
+    set_mode("regression")
+    
+
+
+rf_fun <- function(cluster){
+    data <- clust_data %>% 
+        filter(kmeans == {{cluster}}, !wday%in%c(1, 7))
+    
+    splits <- initial_split(data, prop = 0.7)
+    train <- training(splits)
+    test <- testing(splits)
+    
+    rf_spec <- rand_forest(mtry = tune(), 
+                          trees = 100, 
+                          min_n = tune()) %>%  
+    set_engine("ranger") %>%
+    set_mode("regression")
+
+    rf_wf <- workflow() %>% 
+        add_formula(count~.) %>% 
+        add_model(rf_spec)
+    
+    vfold <- vfold_cv(train, v = 5)
+    
+    doParallel::registerDoParallel()
+    rf_res <- tune_grid(
+        rf_wf, 
+        resamples = vfold, 
+        metrics = metric_set(rmse), 
+        control = control_grid(save_pred = TRUE))
+    
+    best_param <- select_best(rf_res, 'rmse')
+    final_rf <- finalize_workflow(rf_wf, best_param)
+    rf_fit <- fit(final_rf, train)
+    pred_rf <- last_fit(final_rf, splits) %>% 
+        collect_predictions()
+    pred_rf
+}
+
+cluster0 <- rf_fun(0) %>% 
+    as_tibble()
+
+rr <- cluster0 %>% 
+    rmse(.pred, count)
+rr$.estimate
+
+cluster0 %>% 
+    ggplot() + 
+    geom_line(aes(x = .row, y = count, color = 'real')) + 
+    geom_line(aes(x = .row, y = .pred, color = 'pred'))
+
+
+
+
+rmse_result <- list()
+
+library(tictoc)
+
+tic()
+for (i in 1:20) {
+    result <- rf_fun(i) %>% 
+        as_tibble()
+    result <- result %>% rmse(.pred, count)
+    rmse_result[i] <- result$.estimate
+}
+toc()
+rmse_result %>% as.data.frame() %>% 
+    rowMeans()
+
+rmse_result2 <- list()
+tic()
+for (i in 43:80) {
+    result <- rf_fun(i) %>% 
+        as_tibble()
+    result <- result %>% rmse(.pred, count)
+    rmse_result2[i] <- result$.estimate
+}
+toc()
+
+rmse_result2[43:79] %>% as_tibble()
+unlist(rmse_result2) %>% mean()
+
+```
+
+
+-   cluster 날짜 별 빈도 맞추기 
+-   환경 변수 추가 
+-   node2vec embedding space 차원 지정 어떻게 할지 지표 탐색 
+-   kmeans clustering 군집 개수별 성능 비교(선행 논문 참고)
+-   random forest or xgboost or lightgbm or tabnet 
+-   성능 고도화 
+-   bgnn 적용해보기 
+
+
